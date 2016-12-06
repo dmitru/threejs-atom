@@ -92,11 +92,18 @@
 	<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.1.0/jquery.min.js"></script>
 
   <script>
-  	var ww, wh, renderer, scene, camera, world, material, controls;
+  	/*
+  	 * Visualization
+  	 */
+  	var ww, wh;
+  	var renderer, scene, camera, world, material, controls;
+  	var currentVolume = 0;
 
 		var Config = {
-		  LAYERS: { min: 1, max: 10, step: 1, value: 3 },
+			AUDIO_SENSITIVITY: { min: 0, max: 1.0, step: 0.001, value: 0.1 },
+			AUDIO_AVERAGING: { min: 0, max: 1.0, step: 0.0001, value: 0.97 },
 
+		  LAYERS: { min: 1, max: 10, step: 1, value: 3 },
 		  N: { min: 10, max: 1500, step: 10, value: 200 },
 
 		  RADIUS: { min: 10, max: 500, step: 10, value: 220 },
@@ -104,7 +111,7 @@
 		  RADIUS_VARIABILITY: { min: 0.00, max: 2.0, step: 0.005, value: 0.185 },
 		  RADIUS_VARIABILITY_POWER: { min: 0.2, max: 4.0, step: 0.005, value: 1.485 },
 
-		  OPACITY: { min: 0.01, max: 1.0, step: 0.01, value: 0.15 },
+		  OPACITY: { min: 0.01, max: 0.5, step: 0.001, value: 0.15 },
 		  OPACITY_VARIABILITY: { min: 0.00, max: 2.0, step: 0.01, value: 0.2 },
 		  OPACITY_PULSE_PERIOD: { min: 0.1, max: 10, step: 0.01, value: 2.4 },
 		  OPACITY_PULSE_DEPTH: { min: 0.00, max: 1.0, step: 0.01, value: 0.1 },
@@ -139,14 +146,21 @@
 
 		var layerConfigs = buildLayerConfigs(Config);
 
+		function onParametersChanged() {
+			layerConfigs = buildLayerConfigs(Config);
+			recreateScene();
+			reinitAudio();
+		}
+
 		function recreateScene() {
-		  layerConfigs = buildLayerConfigs(Config);
-		  scene.remove(world);
+		  if (scene) {
+		  	scene.remove(world);
+		  }
 		  world = createWorld();
 		  scene.add(world);
 		}
 
-		function initInputs() {
+		function initControls() {
 		  controls = $('#controls');
 		  controls.click(function(e) { e.stopPropagation(); });
 		  $(document).click(function(e) {
@@ -171,7 +185,7 @@
 		        const value = parseFloat(e.target.value);
 		        console.log(key + ' = ' + value);
 		        Config[key].value = value;
-		        recreateScene();
+		        onParametersChanged();
 		        window.location.hash = encodeConfig(Config);
 		      });
 		    label.append($('<div>').text(key));
@@ -180,7 +194,7 @@
 		  });
 		}
 
-		function init() {
+		function initScene() {
 		  ww = window.innerWidth;
 		  wh = window.innerHeight;
 
@@ -198,13 +212,10 @@
 		  camera.position.set(0, 0, 600);
 		  scene.add(camera);
 
-		  world = createWorld();
-		  scene.add(world);
+		  onParametersChanged();
 
 		  requestAnimationFrame(render);
 		  window.addEventListener("resize", onWindowResize);
-
-		  initInputs();
 		}
 
 		function onWindowResize() {
@@ -215,6 +226,11 @@
 		  camera.updateProjectionMatrix();
 
 		  renderer.setSize(ww, wh);
+		}
+
+		function onVolumeUpdated(volume) {
+			// volume: a float in [0, 1]
+			currentVolume = volume;
 		}
 
 		function createWorld() {
@@ -269,10 +285,12 @@
 		    transparent: true, 
 		    depthWrite: false,
 		  });
+		  material.baseOpacity = Config.OPACITY.value;
+
 		  const maxOpacity = Config.OPACITY.value * 
 		    (1.0 + Config.OPACITY_PULSE_DEPTH.value + Math.random() * Config.OPACITY_VARIABILITY.value);
 		  TweenMax.to(material, Config.OPACITY_PULSE_PERIOD.value, {
-		    opacity: maxOpacity,
+		    baseOpacity: maxOpacity,
 		    repeat: -1,
 		    yoyo: true,
 		    ease: Power2.easeIn,
@@ -311,10 +329,17 @@
 		    layer.rotation.z += layerConfig.rotZ;
 
 		    layer.scale.set(
-		      1.0 * (1.0 + layer.scaleFactor),
-		      1.0 * (1.0 + layer.scaleFactor),
-		      1.0 * (1.0 + layer.scaleFactor)
+		      1.0 * (1.0 + layer.scaleFactor + 
+		      	Config.AUDIO_SENSITIVITY.value * currentVolume),
+		      1.0 * (1.0 + layer.scaleFactor + 
+		      	Config.AUDIO_SENSITIVITY.value * currentVolume),
+		      1.0 * (1.0 + layer.scaleFactor + 
+		      	Config.AUDIO_SENSITIVITY.value * currentVolume)
 		    );
+
+		    material.opacity = 
+        	material.baseOpacity * 
+        	(1.0 + 10 * Config.AUDIO_SENSITIVITY.value * currentVolume);
 
 		    if (Config.JITTER_PROBABILITY.value > 0) {
 		      _.forEach(layer.children, function(ellipse) {
@@ -368,14 +393,159 @@
 		  if (window.location.hash) {
 		    try {
 		      Config = decodeConfig(window.location.hash.substr(1));
-		      recreateScene();
 		    } catch (err) {
 		      console.error(err);
 		    }
 		  }
 
-		  init();
+		  initScene();
+		  initControls();
+		  initAudio();
 		});
+  </script>
+
+  <script>
+  	/*
+  	 * Reacting to audio volume
+  	 */
+		function volumeAudioProcess(event) {
+			var buf = event.inputBuffer.getChannelData(0);
+		  var bufLength = buf.length;
+			var sum = 0;
+		  var x;
+
+			// Do a root-mean-square on the samples: sum up the squares...
+	    for (var i=0; i<bufLength; i++) {
+	    	x = buf[i];
+	    	if (Math.abs(x)>=this.clipLevel) {
+	    		this.clipping = true;
+	    		this.lastClip = window.performance.now();
+	    	}
+	    	sum += x * x;
+	    }
+
+	    // ... then take the square root of the sum.
+	    var rms =  Math.sqrt(sum / bufLength);
+
+	    // Now smooth this out with the averaging factor applied
+	    // to the previous sample - take the max here because we
+	    // want "fast attack, slow release."
+	    this.volume = Math.max(rms, this.volume * this.averaging);
+		}
+
+		function createAudioMeter(audioContext, { clipLevel, averaging, clipLag }) {
+			var processor = audioContext.createScriptProcessor(512);
+			processor.onaudioprocess = volumeAudioProcess;
+			processor.clipping = false;
+			processor.lastClip = 0;
+			processor.volume = 0;
+			processor.clipLevel = clipLevel || 0.98;
+			processor.averaging = averaging || 0.97;
+			processor.clipLag = clipLag || 750;
+
+			// this will have no effect, since we don't copy the input to the output,
+			// but works around a current Chrome bug.
+			processor.connect(audioContext.destination);
+
+			processor.checkClipping =
+				function(){
+					if (!this.clipping)
+						return false;
+					if ((this.lastClip + this.clipLag) < window.performance.now())
+						this.clipping = false;
+					return this.clipping;
+				};
+
+			processor.shutdown =
+				function(){
+					this.disconnect();
+					this.onaudioprocess = null;
+				};
+
+			return processor;
+		}
+
+		var audioContext = null;
+		var meter = null;
+		var canvasContext = null;
+		var WIDTH=500;
+		var HEIGHT=50;
+		var rafID = null;
+
+		function initAudio() {
+		  // monkeypatch Web Audio
+		  window.AudioContext = window.AudioContext || window.webkitAudioContext;
+			
+	    // grab an audio context
+	    audioContext = new AudioContext();
+		    // Attempt to get audio input
+	    try {
+	        // monkeypatch getUserMedia
+	        navigator.getUserMedia = 
+	        	navigator.getUserMedia ||
+	        	navigator.webkitGetUserMedia ||
+	        	navigator.mozGetUserMedia;
+
+	        // ask for an audio input
+	        // TODO: this is going to be deprecated, so switch to a newer API:
+	        // https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia
+	        navigator.getUserMedia(
+	        {
+	            "audio": {
+	                "mandatory": {
+	                    "googEchoCancellation": "false",
+	                    "googAutoGainControl": "false",
+	                    "googNoiseSuppression": "false",
+	                    "googHighpassFilter": "false"
+	                },
+	                "optional": []
+	            },
+	        }, gotStream, didntGetStream);
+	    } catch (e) {
+	        alert('getUserMedia threw exception :' + e);
+	    }
+
+		}
+
+		function reinitAudio() {
+			console.log('Reinit audio');
+			if (!audioContext || !mediaStreamSource || !meter) {
+				return;
+			}
+			if (meter) {
+				meter.disconnect(audioContext.destination);
+				mediaStreamSource.disconnect(meter);
+			}
+			meter = createAudioMeter(audioContext, 
+		    	{ averaging: Config.AUDIO_AVERAGING.value });
+		  mediaStreamSource.connect(meter);
+		}
+
+
+		function didntGetStream() {
+		    alert('Stream generation failed.');
+		}
+
+		var mediaStreamSource = null;
+
+		function gotStream(stream) {
+		    // Create an AudioNode from the stream.
+		    mediaStreamSource = audioContext.createMediaStreamSource(stream);
+
+		    // Create a new volume meter and connect it.
+		    meter = createAudioMeter(audioContext, 
+		    	{ averaging: Config.AUDIO_AVERAGING.value });
+		    mediaStreamSource.connect(meter);
+
+		    // kick off the visual updating
+		    audioUpdateLoop();
+		}
+
+		function audioUpdateLoop(time) {
+		  curVolume = meter.volume;
+		  onVolumeUpdated(meter.volume);
+		  window.requestAnimationFrame(audioUpdateLoop);
+		}
   </script>
 
 </body>
